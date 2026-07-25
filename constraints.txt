@@ -1,0 +1,13 @@
+# Pin the CUDA stack. This is the build that is PROVEN to work with
+# RealVisXL + IPAdapter FaceID + ControlNet Union Promax + Impact Pack
+# on an RTX 4090 (sm_89), verified 2026-07-24 (Ploy 3.0 batch 38, 10/10 seeds).
+#
+# Do NOT relax these. A custom-node requirement will happily pull a different
+# torch and break CUDA silently.
+#
+# NOTE ON BLACKWELL: cu124 has no sm_120 kernels, so this stack will NOT run on
+# an RTX 5090 / RTX PRO Blackwell card. Moving to 5090 means torch >=2.7 + cu128
+# and a full re-verification — it is not a checkbox.
+torch==2.6.0
+torchvision==0.21.0
+torchaudio==2.6.0
