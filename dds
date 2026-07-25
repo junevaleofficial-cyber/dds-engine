@@ -59,8 +59,31 @@ sshx(){ ssh -i "$KEY" -o StrictHostKeyChecking=no -o LogLevel=ERROR \
 kill_pod(){ runpodctl pod stop "$1" >/dev/null 2>&1; sleep 3; runpodctl pod delete "$1" >/dev/null 2>&1; }
 
 # ---------------------------------------------------------------- up
+# Any pod named dds-* that is NOT the one in our state file is an orphan from an
+# interrupted run and is silently billing. Reap it. (Cost real money 2026-07-25:
+# a timed-out `dds up` left a second pod running at $0.69/hr.)
+reap_orphans(){
+  local keep="${1:-none}"
+  local orphans
+  orphans=$(runpodctl pod list -o json 2>/dev/null | python3 -c "
+import sys,json
+keep='$keep'
+try: d=json.load(sys.stdin)
+except: raise SystemExit
+for p in d:
+    n=p.get('name') or ''
+    if n.startswith('dds-') and p.get('id')!=keep: print(p.get('id'))
+" 2>/dev/null)
+  [ -z "$orphans" ] && return 0
+  for o in $orphans; do
+    warn "reaping orphan pod $o (was billing \$0.69/hr)"
+    kill_pod "$o"
+  done
+}
+
 cmd_up(){
   load_state
+  reap_orphans "${POD:-none}"
   if [ -n "${POD:-}" ] && [ "$(pod_alive "$POD")" = yes ]; then
     if INFO=$(ssh_info "$POD"); then
       read -r IP PORT <<<"$INFO"; save_state "$POD" "$IP" "$PORT"
@@ -164,7 +187,7 @@ cmd_gen(){
     return 1
   fi
   [ -z "$LABEL" ] && LABEL="$(basename "${SCRIPT%.py}")-$(date +%m%d-%H%M)"
-  DEST="$DDS_LOCAL_ROOT/_batches/$LABEL"; DL="$HOME/Downloads/DDS - $LABEL"
+  DEST="$DDS_LOCAL_ROOT/${DDS_PERSONA:-Ploy 3.0}/Photos/$LABEL"; DL="$HOME/Downloads/DDS - $LABEL"
   mkdir -p "$DEST" "$DL"
   printf '%s\n' "$NEW" | while read -r f; do
     [ -z "$f" ] && continue
@@ -197,6 +220,7 @@ cmd_ssh(){ load_state; [ -z "${POD:-}" ] && { bad "no pod"; exit 1; }
 
 cmd_down(){
   load_state
+  reap_orphans "${POD:-none}"
   if [ -z "${POD:-}" ]; then dim "no pod recorded"; else
     kill_pod "$POD"; ok "pod $POD stopped and deleted"
   fi
