@@ -1,0 +1,233 @@
+#!/bin/bash
+# ============================================================================
+#  dds — one command to run the DDS image engine on RunPod
+#
+#    dds up              start a pod, verify it, report READY   (auto-retries bad hosts)
+#    dds gen <script>    run a batch and download the images as they finish
+#    dds status          one health line
+#    dds log             tail the pod's boot log
+#    dds ssh             open a shell on the pod
+#    dds down            stop + delete the pod (ends GPU billing)
+#
+#  Built 2026-07-25 after a session that lost ~100 min to manual pod wrangling.
+#  Every check in here exists because it failed for real. See
+#  SOP/Engine Setup/Engine Boot Architecture (post-mortem 2026-07-24).md
+# ============================================================================
+set -uo pipefail
+
+IMAGE="ghcr.io/junevaleofficial-cyber/dds-engine:latest"
+VOLUME="wmennpoi9z"
+DC="EU-RO-1"
+GPU="NVIDIA GeForce RTX 4090"
+DISK=20
+KEY="$HOME/.runpod/ssh/runpodctl-ssh-key"
+STATE="$HOME/.dds_state"
+MAX_HOST_ATTEMPTS=4          # bad-host retries before giving up
+DDS_LOCAL_ROOT="$HOME/Documents/DDS"
+
+c_g=$'\033[32m'; c_r=$'\033[31m'; c_y=$'\033[33m'; c_d=$'\033[2m'; c_0=$'\033[0m'
+ok(){   printf '%s✅ %s%s\n' "$c_g" "$*" "$c_0"; }
+bad(){  printf '%s🔴 %s%s\n' "$c_r" "$*" "$c_0"; }
+warn(){ printf '%s⚠️  %s%s\n' "$c_y" "$*" "$c_0"; }
+dim(){  printf '%s%s%s\n' "$c_d" "$*" "$c_0"; }
+
+need(){ command -v "$1" >/dev/null 2>&1 || { bad "missing required tool: $1"; exit 1; }; }
+need runpodctl; need ssh; need scp; need python3
+
+save_state(){ printf 'POD=%s\nIP=%s\nPORT=%s\n' "$1" "$2" "$3" > "$STATE"; }
+load_state(){ POD=""; IP=""; PORT=""; [ -f "$STATE" ] && . "$STATE"; }
+
+# resolve ip/port for a pod id (empty if not ready)
+ssh_info(){
+  runpodctl ssh info "$1" 2>/dev/null | python3 -c "
+import sys,json
+try: d=json.load(sys.stdin)
+except: raise SystemExit(1)
+ip,p=d.get('ip'),d.get('port')
+print(ip,p) if ip and p else sys.exit(1)
+" 2>/dev/null
+}
+
+pod_alive(){ runpodctl pod list -o json 2>/dev/null | python3 -c "
+import sys,json
+pid='$1'
+print('yes' if any(p.get('id')==pid for p in json.load(sys.stdin)) else 'no')" 2>/dev/null; }
+
+sshx(){ ssh -i "$KEY" -o StrictHostKeyChecking=no -o LogLevel=ERROR \
+             -o ConnectTimeout=20 -p "$PORT" "root@$IP" "$@"; }
+
+kill_pod(){ runpodctl pod stop "$1" >/dev/null 2>&1; sleep 3; runpodctl pod delete "$1" >/dev/null 2>&1; }
+
+# ---------------------------------------------------------------- up
+cmd_up(){
+  load_state
+  if [ -n "${POD:-}" ] && [ "$(pod_alive "$POD")" = yes ]; then
+    if INFO=$(ssh_info "$POD"); then
+      read -r IP PORT <<<"$INFO"; save_state "$POD" "$IP" "$PORT"
+      if sshx 'grep -q DDS_READY /workspace/dds_boot.log' 2>/dev/null; then
+        ok "pod $POD already up and READY  ($IP:$PORT)"; return 0
+      fi
+    fi
+    warn "pod $POD exists but is not READY — replacing it"
+    kill_pod "$POD"
+  fi
+
+  for attempt in $(seq 1 $MAX_HOST_ATTEMPTS); do
+    printf '\n'; dim "── attempt $attempt/$MAX_HOST_ATTEMPTS ──"
+    STOCK=$(runpodctl datacenter list 2>/dev/null | python3 -c "
+import sys,json
+for x in json.load(sys.stdin):
+    if x.get('id')!='$DC': continue
+    for g in x.get('gpuAvailability',[]):
+        if g.get('displayName')=='RTX 4090': print(g.get('stockStatus') or 'none')
+" 2>/dev/null)
+    dim "4090 stock in $DC: ${STOCK:-unknown}"
+    [ "$STOCK" = none ] && { warn "no 4090 stock; trying anyway"; }
+
+    T0=$(date +%s)
+    OUT=$(runpodctl create pod --name "dds-$(date +%H%M%S)" \
+        --imageName "$IMAGE" --gpuType "$GPU" --gpuCount 1 \
+        --dataCenterId "$DC" --networkVolumeId "$VOLUME" --volumePath /workspace \
+        --containerDiskSize "$DISK" --secureCloud --startSSH \
+        --ports "3000/http,22/tcp" 2>&1)
+    POD=$(printf '%s' "$OUT" | sed -n 's/.*pod "\([a-z0-9]*\)".*/\1/p')
+    if [ -z "$POD" ]; then
+      bad "pod create failed: $(printf '%s' "$OUT" | tail -1)"; sleep 20; continue
+    fi
+    dim "pod $POD created — pulling image (4.5 GB)…"
+
+    # wait for ssh
+    IP=""; PORT=""
+    for i in $(seq 1 80); do
+      if INFO=$(ssh_info "$POD"); then
+        read -r IP PORT <<<"$INFO"
+        ssh -i "$KEY" -o StrictHostKeyChecking=no -o LogLevel=ERROR \
+            -o ConnectTimeout=10 -p "$PORT" "root@$IP" true 2>/dev/null && break
+      fi
+      IP=""; sleep 10
+    done
+    if [ -z "$IP" ]; then bad "no SSH after ~13 min — killing pod"; kill_pod "$POD"; continue; fi
+    save_state "$POD" "$IP" "$PORT"
+    dim "ssh up after $(( $(date +%s)-T0 ))s ($IP:$PORT) — waiting for gates…"
+
+    # wait for a boot verdict
+    MARK=""
+    for i in $(seq 1 90); do
+      MARK=$(sshx 'grep -oE "DDS_READY|DDS_REFUSED_[A-Z_]*|DDS_ENGINE_DIED|DDS_ENGINE_EXITED" /workspace/dds_boot.log 2>/dev/null | tail -1' 2>/dev/null)
+      [ -n "$MARK" ] && break
+      sleep 10
+    done
+    ELAPSED=$(( $(date +%s)-T0 ))
+
+    case "$MARK" in
+      DDS_READY)
+        sshx 'grep -E "GATE|host available|python:" /workspace/dds_boot.log | tail -6' 2>/dev/null | sed 's/^/   /'
+        ok "READY in ${ELAPSED}s   pod=$POD   $IP:$PORT"
+        dim "next:  dds gen /workspace/b3_front_bikini.py  |  dds down"
+        return 0 ;;
+      DDS_REFUSED_BAD_HOST)
+        RAM=$(sshx 'grep -o "host available RAM: [0-9-]* GB" /workspace/dds_boot.log | tail -1' 2>/dev/null)
+        warn "bad host ($RAM) — the engine WOULD be OOM-killed. Destroying and retrying on another host."
+        kill_pod "$POD"; continue ;;
+      DDS_REFUSED_*)
+        bad "$MARK"; sshx 'tail -12 /workspace/dds_boot.log' 2>/dev/null | sed 's/^/   /'
+        bad "not a host problem — fix the above, pod left up for inspection ($IP:$PORT)"; return 1 ;;
+      DDS_ENGINE_DIED|DDS_ENGINE_EXITED)
+        bad "engine crashed on boot"; sshx 'tail -25 /workspace/dds_boot.log' 2>/dev/null | sed 's/^/   /'
+        bad "pod left up for inspection: dds ssh"; return 1 ;;
+      *)
+        warn "no verdict after ~15 min — dumping log"; sshx 'tail -15 /workspace/dds_boot.log' 2>/dev/null | sed 's/^/   /'
+        return 1 ;;
+    esac
+  done
+  bad "gave up after $MAX_HOST_ATTEMPTS attempts — RunPod capacity or all hosts starved"; return 1
+}
+
+# ---------------------------------------------------------------- gen
+cmd_gen(){
+  SCRIPT="${1:-}"; LABEL="${2:-}"
+  [ -z "$SCRIPT" ] && { bad "usage: dds gen <script-on-pod> [label]"; exit 1; }
+  load_state
+  [ -z "${POD:-}" ] && { bad "no pod — run: dds up"; exit 1; }
+  sshx true 2>/dev/null || { bad "pod unreachable — run: dds up"; exit 1; }
+
+  BEFORE=$(sshx 'ls /workspace/outputs 2>/dev/null | sort' 2>/dev/null)
+  dim "running $SCRIPT …  (ctrl-c is safe: the batch keeps going on the pod)"
+  # /opt/conda/bin/python is REQUIRED: plain `python` is not on a non-login PATH
+  sshx "cd /workspace && /opt/conda/bin/python '$SCRIPT' 2>&1 | tail -40"
+
+  AFTER=$(sshx 'ls /workspace/outputs 2>/dev/null | sort' 2>/dev/null)
+  NEW=$(comm -13 <(printf '%s\n' "$BEFORE") <(printf '%s\n' "$AFTER") | grep -v '^$' || true)
+  N=$(printf '%s\n' "$NEW" | grep -c . || true)
+  if [ "${N:-0}" -eq 0 ]; then
+    warn "no new images. If the batch 'succeeded' in <1s per seed, a runtime dep is missing (see SOP: insightface)."
+    return 1
+  fi
+  [ -z "$LABEL" ] && LABEL="$(basename "${SCRIPT%.py}")-$(date +%m%d-%H%M)"
+  DEST="$DDS_LOCAL_ROOT/_batches/$LABEL"; DL="$HOME/Downloads/DDS - $LABEL"
+  mkdir -p "$DEST" "$DL"
+  printf '%s\n' "$NEW" | while read -r f; do
+    [ -z "$f" ] && continue
+    scp -q -i "$KEY" -o StrictHostKeyChecking=no -P "$PORT" "root@$IP:/workspace/outputs/$f" "$DEST"/ 2>/dev/null
+  done
+  cp "$DEST"/*.png "$DL"/ 2>/dev/null
+  ok "$N image(s) downloaded"
+  dim "   $DEST"
+  dim "   $DL   (for Quick Look)"
+}
+
+# ---------------------------------------------------------------- status
+cmd_status(){
+  load_state
+  if [ -z "${POD:-}" ]; then dim "no pod recorded — dds up"; return 0; fi
+  if [ "$(pod_alive "$POD")" != yes ]; then dim "pod $POD is not running"; return 0; fi
+  R=$(sshx 'M=$(grep -oE "DDS_READY|DDS_REFUSED_[A-Z_]*|DDS_ENGINE_(DIED|EXITED)" /workspace/dds_boot.log 2>/dev/null | tail -1)
+A=$(curl -s -m 5 http://127.0.0.1:3000/system_stats >/dev/null 2>&1 && echo up || echo down)
+G=$(nvidia-smi --query-gpu=utilization.gpu,memory.used --format=csv,noheader 2>/dev/null | tr -d " ")
+H=$(free -g | awk "/^Mem:/{print \$7}")
+O=$(ls /workspace/outputs 2>/dev/null | wc -l | tr -d " ")
+echo "boot=$M api=$A gpu=$G hostfree=${H}GB outputs=$O"' 2>/dev/null)
+  [ -z "$R" ] && { warn "pod $POD unreachable"; return 1; }
+  printf 'pod=%s %s\n' "$POD" "$R"
+}
+
+cmd_log(){ load_state; [ -z "${POD:-}" ] && { bad "no pod"; exit 1; }; sshx 'tail -40 /workspace/dds_boot.log'; }
+cmd_ssh(){ load_state; [ -z "${POD:-}" ] && { bad "no pod"; exit 1; }
+  exec ssh -i "$KEY" -o StrictHostKeyChecking=no -p "$PORT" "root@$IP"; }
+
+cmd_down(){
+  load_state
+  if [ -z "${POD:-}" ]; then dim "no pod recorded"; else
+    kill_pod "$POD"; ok "pod $POD stopped and deleted"
+  fi
+  rm -f "$STATE"
+  runpodctl pod list -o json 2>/dev/null | python3 -c "
+import sys,json; d=json.load(sys.stdin)
+print('running pods:', len(d))
+[print('  still up:', p.get('id'), p.get('name')) for p in d]"
+  runpodctl user 2>/dev/null | python3 -c "
+import sys,json; d=json.load(sys.stdin)
+print('balance: \$%.2f   spend/hr: \$%s' % (d['clientBalance'], d['currentSpendPerHr']))"
+}
+
+case "${1:-}" in
+  up)     cmd_up ;;
+  gen)    shift; cmd_gen "$@" ;;
+  status) cmd_status ;;
+  log)    cmd_log ;;
+  ssh)    cmd_ssh ;;
+  down)   cmd_down ;;
+  *) cat <<'H'
+dds — DDS image engine on RunPod
+
+  dds up            start a pod and verify it        (auto-retries bad hosts)
+  dds gen <script>  run a batch, download the images
+  dds status        one health line
+  dds log          tail the pod's boot log
+  dds ssh           shell onto the pod
+  dds down          stop + delete the pod (ends GPU billing)
+
+e.g.   dds up && dds gen /workspace/b3_front_bikini.py "38 bikini bust2.0" && dds down
+H
+  ;;
+esac
