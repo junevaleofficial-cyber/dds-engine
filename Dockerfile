@@ -32,7 +32,9 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
     PYTHONPYCACHEPREFIX=/tmp/pyc \
-    COMFY_HOME=/opt/ComfyUI
+    COMFY_HOME=/opt/ComfyUI \
+    CC=gcc \
+    CXX=g++
 
 COPY constraints.txt /opt/constraints.txt
 
@@ -40,6 +42,7 @@ COPY constraints.txt /opt/constraints.txt
 # procps: pgrep/pkill are used by the entrypoint gates.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         git curl ca-certificates openssh-server procps \
+        gcc g++ \
         libgl1 libglib2.0-0 \
     && mkdir -p /var/run/sshd /root/.ssh \
     && chmod 700 /root/.ssh \
@@ -80,6 +83,11 @@ RUN set -eux; \
 RUN pip install -c /opt/constraints.txt insightface onnxruntime-gpu
 
 # ---- Fail the BUILD, not a pod at 2am ----
+# gcc must exist at RUNTIME: triton compiles a CUDA driver shim on first use.
+# The 'runtime' base ships no compiler -> "Failed to find C compiler" killed the
+# engine on first boot (2026-07-25). Verified here so it can never regress.
+RUN which gcc && gcc --version | head -1
+
 RUN cd $COMFY_HOME && python -c "\
 import torch, insightface, onnxruntime, comfy.ldm.models; \
 assert torch.__version__.startswith('2.6.0'), 'torch drifted: '+torch.__version__; \
