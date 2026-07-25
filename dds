@@ -21,7 +21,9 @@ DC="EU-RO-1"
 GPU="NVIDIA GeForce RTX 4090"
 DISK=20
 KEY="$HOME/.runpod/ssh/runpodctl-ssh-key"
-STATE="$HOME/.dds_state"
+PERSONA="${DDS_PERSONA:-Ploy 3.0}"
+PSLUG=$(printf '%s' "$PERSONA" | tr 'A-Z ' 'a-z-' | tr -cd 'a-z0-9-')
+STATE="$HOME/.dds_state_$PSLUG"
 MAX_HOST_ATTEMPTS=4          # bad-host retries before giving up
 DDS_LOCAL_ROOT="$HOME/Documents/DDS"
 
@@ -59,9 +61,11 @@ sshx(){ ssh -i "$KEY" -o StrictHostKeyChecking=no -o LogLevel=ERROR \
 kill_pod(){ runpodctl pod stop "$1" >/dev/null 2>&1; sleep 3; runpodctl pod delete "$1" >/dev/null 2>&1; }
 
 # ---------------------------------------------------------------- up
-# Any pod named dds-* that is NOT the one in our state file is an orphan from an
-# interrupted run and is silently billing. Reap it. (Cost real money 2026-07-25:
-# a timed-out `dds up` left a second pod running at $0.69/hr.)
+# Reap orphans belonging to THIS PERSONA ONLY.
+# An interrupted `dds up` leaves a pod billing at $0.69/hr with no record of it
+# (cost real money 2026-07-25). But scoping matters: the first version reaped ANY
+# dds-* pod not in the local state file, which would have DESTROYED ANOTHER
+# CHAT'S LIVE ENGINE MID-BATCH. Never widen this match beyond "dds-$PSLUG-".
 reap_orphans(){
   local keep="${1:-none}"
   local orphans
@@ -72,7 +76,7 @@ try: d=json.load(sys.stdin)
 except: raise SystemExit
 for p in d:
     n=p.get('name') or ''
-    if n.startswith('dds-') and p.get('id')!=keep: print(p.get('id'))
+    if n.startswith('dds-$PSLUG-') and p.get('id')!=keep: print(p.get('id'))
 " 2>/dev/null)
   [ -z "$orphans" ] && return 0
   for o in $orphans; do
@@ -96,7 +100,7 @@ cmd_up(){
   fi
 
   for attempt in $(seq 1 $MAX_HOST_ATTEMPTS); do
-    printf '\n'; dim "── attempt $attempt/$MAX_HOST_ATTEMPTS ──"
+    printf '\n'; dim "── persona: $PERSONA  ·  attempt $attempt/$MAX_HOST_ATTEMPTS ──"
     STOCK=$(runpodctl datacenter list 2>/dev/null | python3 -c "
 import sys,json
 for x in json.load(sys.stdin):
@@ -108,10 +112,11 @@ for x in json.load(sys.stdin):
     [ "$STOCK" = none ] && { warn "no 4090 stock; trying anyway"; }
 
     T0=$(date +%s)
-    OUT=$(runpodctl create pod --name "dds-$(date +%H%M%S)" \
+    OUT=$(runpodctl create pod --name "dds-$PSLUG-$(date +%H%M%S)" \
         --imageName "$IMAGE" --gpuType "$GPU" --gpuCount 1 \
         --dataCenterId "$DC" --networkVolumeId "$VOLUME" --volumePath /workspace \
         --containerDiskSize "$DISK" --secureCloud --startSSH \
+        --env "DDS_PERSONA=$PERSONA" \
         --ports "3000/http,22/tcp" 2>&1)
     POD=$(printf '%s' "$OUT" | sed -n 's/.*pod "\([a-z0-9]*\)".*/\1/p')
     if [ -z "$POD" ]; then
@@ -187,7 +192,7 @@ cmd_gen(){
     return 1
   fi
   [ -z "$LABEL" ] && LABEL="$(basename "${SCRIPT%.py}")-$(date +%m%d-%H%M)"
-  DEST="$DDS_LOCAL_ROOT/${DDS_PERSONA:-Ploy 3.0}/Photos/$LABEL"; DL="$HOME/Downloads/DDS - $LABEL"
+  DEST="$DDS_LOCAL_ROOT/$PERSONA/Photos/$LABEL"; DL="$HOME/Downloads/DDS - $LABEL"
   mkdir -p "$DEST" "$DL"
   printf '%s\n' "$NEW" | while read -r f; do
     [ -z "$f" ] && continue
