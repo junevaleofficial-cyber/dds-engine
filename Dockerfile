@@ -82,11 +82,34 @@ RUN set -eux; \
 # Nothing declares insightface, but FaceID cannot work without it.
 RUN pip install -c /opt/constraints.txt insightface onnxruntime-gpu
 
+# ---- LoRA TRAINER (kohya sd-scripts) ----
+# Added 2026-07-26 for B4: the image was ComfyUI-only, so there was no way to
+# train a LoRA on the pod at all. Same git+/URL stripping as the custom nodes:
+# sd-scripts' requirements.txt ends in '-e .', and PEP-517 build isolation would
+# spawn a nested pip that re-downloads torch with --ignore-installed, bypassing
+# the constraints file (this is what hung a build for 22 minutes on sam2).
+# We run the training scripts from their own directory, so '-e .' is not needed.
+ARG SD_SCRIPTS_REF=main
+RUN git clone https://github.com/kohya-ss/sd-scripts.git /opt/sd-scripts \
+    && cd /opt/sd-scripts && git checkout $SD_SCRIPTS_REF \
+    && grep -vE '^[[:space:]]*(git\+|https?://|-e )' requirements.txt \
+       | grep -vE '^[[:space:]]*(#|$)' > /tmp/train_req.txt \
+    && pip install -c /opt/constraints.txt -r /tmp/train_req.txt
+
 # ---- Fail the BUILD, not a pod at 2am ----
 # gcc must exist at RUNTIME: triton compiles a CUDA driver shim on first use.
 # The 'runtime' base ships no compiler -> "Failed to find C compiler" killed the
 # engine on first boot (2026-07-25). Verified here so it can never regress.
 RUN which gcc && gcc --version | head -1
+
+# The trainer must import BEFORE a pod ever tries to use it. A missing
+# accelerate/transformers here would otherwise surface hours into stage 4.
+RUN cd /opt/sd-scripts && python -c "\
+import accelerate, transformers, safetensors; \
+import library.train_util; \
+import torch; \
+assert torch.__version__.startswith('2.6.0'), 'trainer deps moved torch: '+torch.__version__; \
+print('TRAIN_VERIFY_OK accelerate', accelerate.__version__, 'transformers', transformers.__version__)"
 
 RUN cd $COMFY_HOME && python -c "\
 import torch, insightface, onnxruntime, comfy.ldm.models; \
